@@ -3,7 +3,7 @@
 The main task `process_repository` coordinates the full pipeline:
 1. Clone repository (git_service)
 2. Parse source files (parser_service)
-3. Generate embeddings (rag_service)
+3. Index code chunks for local retrieval (rag_service)
 4. Update database status at each step
 5. Clean up temporary files on completion or failure
 """
@@ -11,7 +11,6 @@ The main task `process_repository` coordinates the full pipeline:
 import logging
 from pathlib import Path
 
-from openai import APIStatusError
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
@@ -23,21 +22,6 @@ from app.services.rag_service import RAGService
 from app.worker.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
-
-
-def _format_task_error(exc: Exception) -> str:
-    """Return an actionable message for known provider errors."""
-    if isinstance(exc, APIStatusError) and isinstance(exc.body, dict):
-        error = exc.body.get("error", exc.body)
-        if isinstance(error, dict) and (
-            error.get("code") in {"credit_balance_exhausted", "insufficient_quota"}
-            or error.get("type") == "insufficient_quota"
-        ):
-            return (
-                "OpenAI API credits are exhausted. Add credits to the organization "
-                "used by OPENAI_API_KEY, then submit this repository again."
-            )
-    return str(exc)
 
 
 def _get_db() -> Session:
@@ -177,7 +161,7 @@ def process_repository(self, repo_id: str) -> dict:  # type: ignore[type-arg]
             len([r for r in parse_results if not r.error]),
         )
 
-        # ── Step 3: Embed ────────────────────────────────────
+        # ── Step 3: Index ────────────────────────────────────
         _update_repo_status(db, repo_id, RepositoryStatus.EMBEDDING)
 
         # Generate code chunks from all parsed files
@@ -198,12 +182,12 @@ def process_repository(self, repo_id: str) -> dict:  # type: ignore[type-arg]
                     )
                     all_chunks.extend(chunks)
 
-        # Generate embeddings and upsert to Qdrant
+        # Store searchable code chunks in Qdrant
         if all_chunks:
-            point_ids = rag_service.generate_embeddings(all_chunks, repo_id)
-            logger.info("Generated %d embeddings", len(point_ids))
+            point_ids = rag_service.store_code_chunks(all_chunks, repo_id)
+            logger.info("Stored %d code chunks for local retrieval", len(point_ids))
         else:
-            logger.warning("No code chunks generated for embedding")
+            logger.warning("No code chunks generated for local retrieval")
 
         # ── Step 4: Done ─────────────────────────────────────
         _update_repo_status(db, repo_id, RepositoryStatus.READY)
@@ -228,7 +212,7 @@ def process_repository(self, repo_id: str) -> dict:  # type: ignore[type-arg]
         logger.error("Pipeline failed for %s: %s", repo_id, exc, exc_info=True)
         _update_repo_status(
             db, repo_id, RepositoryStatus.ERROR,
-            error_message=_format_task_error(exc),
+            error_message=str(exc),
         )
         raise
 

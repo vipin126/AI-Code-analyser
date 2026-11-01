@@ -6,6 +6,10 @@ import RepositoryCard from "@/components/RepositoryCard";
 import { api } from "@/lib/api";
 import { RepositoryItem } from "@/types";
 
+function uniqueRepositories(repositories: RepositoryItem[]): RepositoryItem[] {
+  return [...new Map(repositories.map((repo) => [repo.id, repo])).values()];
+}
+
 export default function DashboardPage() {
   const [repositories, setRepositories] = useState<RepositoryItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -14,7 +18,7 @@ export default function DashboardPage() {
   const fetchRepos = async () => {
     try {
       const data = await api.listRepositories();
-      setRepositories(data);
+      setRepositories(uniqueRepositories(data));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load repositories");
     } finally {
@@ -27,14 +31,19 @@ export default function DashboardPage() {
 
     // Polling interval (every 4 seconds) to update active processing states
     const interval = setInterval(() => {
-      api.listRepositories().then(setRepositories).catch(() => {});
+      api
+        .listRepositories()
+        .then((data) => setRepositories(uniqueRepositories(data)))
+        .catch((err) => console.error("Failed to refresh repositories:", err));
     }, 4000);
 
     return () => clearInterval(interval);
   }, []);
 
   const handleCreated = (newRepo: RepositoryItem) => {
-    setRepositories((prev) => [newRepo, ...prev]);
+    setRepositories((prev) =>
+      uniqueRepositories([newRepo, ...prev.filter((repo) => repo.id !== newRepo.id)])
+    );
   };
 
   const handleDelete = async (id: string) => {

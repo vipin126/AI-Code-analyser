@@ -23,10 +23,10 @@ class ChatSession(BaseModel):
 
     __tablename__ = "chat_sessions"
 
-    user_id: Mapped[uuid.UUID] = mapped_column(
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     repository_id: Mapped[uuid.UUID] = mapped_column(

@@ -2,7 +2,6 @@
 
 from pydantic import BaseModel, Field
 
-
 # ── AST Parse Results ────────────────────────────────────────
 
 class ASTNode(BaseModel):
@@ -51,10 +50,10 @@ class DependencyGraph(BaseModel):
     language_breakdown: dict[str, int] = Field(default_factory=dict)
 
 
-# ── RAG / Embedding Schemas ──────────────────────────────────
+# ── RAG / Code Search Schemas ───────────────────────────────
 
 class CodeChunk(BaseModel):
-    """A semantically meaningful chunk of code for embedding."""
+    """A meaningful chunk of source code for retrieval."""
 
     content: str
     file_path: str
@@ -79,6 +78,6 @@ class RetrievedContext(BaseModel):
     language: str
     relevance_score: float = Field(ge=0.0, le=1.0)
     retrieval_method: str = Field(
-        default="vector",
-        description="How this chunk was found: vector, structural, hybrid",
+        default="lexical",
+        description="How this chunk was found: lexical, structural, hybrid",
     )

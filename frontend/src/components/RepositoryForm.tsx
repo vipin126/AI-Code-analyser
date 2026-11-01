@@ -42,7 +42,7 @@ export default function RepositoryForm({ onSuccess }: RepositoryFormProps) {
       <h2 className="text-xl font-bold text-white mb-2">Ingest New Repository</h2>
       <p className="text-sm text-gray-400 mb-6">
         Enter a public GitHub repository URL to initiate AST dependency extraction,
-        vector indexing, and architecture visualization.
+        local code-search indexing, and architecture visualization.
       </p>
 
       <form onSubmit={handleSubmit} className="space-y-4">

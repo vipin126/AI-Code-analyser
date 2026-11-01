@@ -34,7 +34,7 @@ const statusConfig: Record<
     animate: true,
   },
   embedding: {
-    label: "Embedding Chunks...",
+    label: "Indexing Chunks...",
     bg: "bg-purple-500/10",
     text: "text-purple-400",
     border: "border-purple-500/30",

@@ -26,56 +26,69 @@ export default function RepositoryDetailPage({ params }: PageProps) {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    async function loadData() {
-      try {
-        setLoading(true);
-        const repoDetail = await api.getRepository(id);
-        setRepo(repoDetail);
+    let active = true;
+    let analysisLoaded = false;
+    let analysisLoading = false;
+    let interval: ReturnType<typeof setInterval> | null = null;
 
-        if (repoDetail.status === "ready") {
-          try {
-            const [graph, filesRes] = await Promise.all([
-              api.getDependencyGraph(id),
-              api.listFiles(id),
-            ]);
-            setGraphData(graph);
-            setFiles(filesRes.files);
-          } catch (e) {
-            console.error("Secondary graph/file load error:", e);
-          }
+    setLoading(true);
+    setError(null);
+    setRepo(null);
+    setGraphData(null);
+    setFiles([]);
+
+    async function loadAnalysis() {
+      if (!active || analysisLoaded || analysisLoading) return;
+      analysisLoading = true;
+      try {
+        const [graph, filesRes] = await Promise.all([
+          api.getDependencyGraph(id),
+          api.listFiles(id),
+        ]);
+        if (active) {
+          setGraphData(graph);
+          setFiles(filesRes.files);
+          analysisLoaded = true;
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Failed to load repository");
+        console.error("Failed to load repository graph and files:", err);
       } finally {
-        setLoading(false);
+        analysisLoading = false;
       }
     }
 
-    loadData();
-
-    // If still in progress, poll until ready
-    const interval = setInterval(async () => {
+    async function loadRepository(initialLoad = false) {
       try {
         const update = await api.getRepository(id);
+        if (!active) return;
         setRepo(update);
-        if (update.status === "ready" && !graphData) {
-          const [graph, filesRes] = await Promise.all([
-            api.getDependencyGraph(id),
-            api.listFiles(id),
-          ]);
-          setGraphData(graph);
-          setFiles(filesRes.files);
-        }
-        if (update.status === "ready" || update.status === "error") {
+        if (update.status === "ready") {
+          await loadAnalysis();
+          if (analysisLoaded && interval) clearInterval(interval);
+        } else if (update.status === "error" && interval) {
           clearInterval(interval);
         }
-      } catch {
-        // ignore polling failures
+      } catch (err) {
+        if (initialLoad && active) {
+          setError(err instanceof Error ? err.message : "Failed to load repository");
+        } else if (active) {
+          console.error("Failed to refresh repository status:", err);
+        }
+      } finally {
+        if (initialLoad && active) setLoading(false);
       }
+    }
+
+    void loadRepository(true);
+    interval = setInterval(() => {
+      void loadRepository();
     }, 4000);
 
-    return () => clearInterval(interval);
-  }, [id, graphData]);
+    return () => {
+      active = false;
+      if (interval) clearInterval(interval);
+    };
+  }, [id]);
 
   if (loading) {
     return (
@@ -138,7 +151,7 @@ export default function RepositoryDetailPage({ params }: PageProps) {
                   : "bg-blue-500/10 text-blue-400 border border-blue-500/30 animate-pulse"
               }`}
             >
-              Status: {repo.status.toUpperCase()}
+              Status: {repo.status === "embedding" ? "INDEXING" : repo.status.toUpperCase()}
             </span>
           </div>
         </div>
@@ -214,7 +227,10 @@ export default function RepositoryDetailPage({ params }: PageProps) {
           <div className="h-6 w-6 border-2 border-primary-500 border-t-transparent rounded-full animate-spin mx-auto" />
           <h3 className="font-semibold text-white">Repository Ingestion In Progress</h3>
           <p className="text-xs text-gray-400 max-w-md mx-auto">
-            Current stage: <strong className="text-primary-400">{repo.status}</strong>.
+            Current stage:{" "}
+            <strong className="text-primary-400">
+              {repo.status === "embedding" ? "indexing chunks" : repo.status}
+            </strong>.
             Parsed {repo.parsed_files} of {repo.total_files} files.
             The interactive diagrams and RAG search will activate once finished.
           </p>

@@ -1,23 +1,26 @@
-"""RAG service — hybrid retrieval pipeline combining vector + structural search.
+"""RAG service — local lexical retrieval combined with AST structural search.
 
 Handles:
-- Code chunk embedding generation via OpenAI text-embedding-3-small
-- Qdrant vector upsert and search
+- Code chunk storage in Qdrant
+- Local BM25 retrieval over stored chunk payloads
 - Structural search against AST node names
 - Hybrid merge and re-ranking of results
 """
 
 import logging
+import math
+import re
 import uuid
+from collections import Counter
 from typing import Any
 
-from openai import OpenAI
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
     Distance,
     FieldCondition,
     Filter,
     MatchValue,
+    PayloadSchemaType,
     PointStruct,
     VectorParams,
 )
@@ -28,25 +31,22 @@ from app.schemas.analysis import CodeChunk, RetrievedContext
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────
-EMBEDDING_DIMENSION = 1536  # text-embedding-3-small output dimension
 MAX_CHUNKS_PER_BATCH = 100
-MAX_TOKENS_PER_CHUNK = 1500
+QDRANT_SCROLL_PAGE_SIZE = 256
+LOCAL_INDEX_DIMENSIONS = 1
 
 
 class RAGService:
-    """Service for embedding code chunks and performing hybrid retrieval.
+    """Store code chunks and perform local hybrid retrieval.
 
-    Combines vector similarity search (Qdrant) with structural AST search
-    to produce ranked context chunks for LLM prompt assembly.
+    Combines BM25 keyword ranking with structural AST search to produce
+    ranked context chunks for LLM prompt assembly.
     """
 
     def __init__(self) -> None:
         self.settings = get_settings()
 
-        # OpenAI client for embeddings
-        self._openai = OpenAI(api_key=self.settings.openai_api_key)
-
-        # Qdrant client for vector storage
+        # Qdrant stores code-chunk payloads; retrieval ranks them locally with BM25.
         if self.settings.qdrant_url:
             self._qdrant = QdrantClient(
                 url=self.settings.qdrant_url,
@@ -65,7 +65,7 @@ class RAGService:
         Args:
             collection_name: Override collection name. Defaults to settings.
         """
-        name = collection_name or self.settings.qdrant_collection_name
+        name = collection_name or self.settings.openrouter_qdrant_collection_name
 
         collections = self._qdrant.get_collections().collections
         existing_names = {c.name for c in collections}
@@ -74,7 +74,7 @@ class RAGService:
             self._qdrant.create_collection(
                 collection_name=name,
                 vectors_config=VectorParams(
-                    size=EMBEDDING_DIMENSION,
+                    size=LOCAL_INDEX_DIMENSIONS,
                     distance=Distance.COSINE,
                 ),
             )
@@ -82,19 +82,24 @@ class RAGService:
         else:
             logger.info("Qdrant collection already exists: %s", name)
 
-    def generate_embeddings(
+        self._qdrant.create_payload_index(
+            collection_name=name,
+            field_name="repository_id",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+
+    def store_code_chunks(
         self,
         chunks: list[CodeChunk],
         repository_id: str,
     ) -> list[str]:
-        """Generate embeddings for code chunks and upsert to Qdrant.
+        """Store code chunks in Qdrant for local lexical retrieval.
 
-        Processes chunks in batches to respect API rate limits.
-        Each chunk is stored with metadata (file_path, language, line range)
-        for filtered retrieval.
+        A fixed placeholder vector is required by the Qdrant collection schema;
+        retrieval uses the stored payload and does not compare these vectors.
 
         Args:
-            chunks: Code chunks to embed.
+            chunks: Code chunks to store for local retrieval.
             repository_id: Repository UUID for namespace isolation.
 
         Returns:
@@ -109,28 +114,15 @@ class RAGService:
         # Process in batches
         for i in range(0, len(chunks), MAX_CHUNKS_PER_BATCH):
             batch = chunks[i : i + MAX_CHUNKS_PER_BATCH]
-            texts = [self._prepare_chunk_text(chunk) for chunk in batch]
-
-            # Generate embeddings via OpenAI
-            try:
-                response = self._openai.embeddings.create(
-                    input=texts,
-                    model=self.settings.openai_embedding_model,
-                )
-                embeddings = [item.embedding for item in response.data]
-            except Exception as e:
-                logger.error("OpenAI embedding error (batch %d): %s", i, e)
-                raise
-
             # Build Qdrant points
             points: list[PointStruct] = []
-            for chunk, embedding in zip(batch, embeddings, strict=True):
+            for chunk in batch:
                 point_id = str(uuid.uuid4())
                 all_point_ids.append(point_id)
 
                 points.append(PointStruct(
                     id=point_id,
-                    vector=embedding,
+                    vector=[1.0],
                     payload={
                         "repository_id": repository_id,
                         "file_path": chunk.file_path,
@@ -146,20 +138,25 @@ class RAGService:
 
             # Upsert to Qdrant
             self._qdrant.upsert(
-                collection_name=self.settings.qdrant_collection_name,
+                collection_name=self.settings.openrouter_qdrant_collection_name,
                 points=points,
             )
 
             logger.info(
-                "Embedded batch %d-%d (%d chunks)",
+                "Stored code chunk batch %d-%d (%d chunks)",
                 i, i + len(batch), len(batch),
             )
 
         logger.info(
-            "Generated %d embeddings for repository %s",
+            "Stored %d code chunks for repository %s",
             len(all_point_ids), repository_id,
         )
         return all_point_ids
+
+    @staticmethod
+    def _tokenize(text: str) -> list[str]:
+        """Split code and natural-language text into searchable terms."""
+        return re.findall(r"[a-z0-9_]+", text.casefold())
 
     async def hybrid_search(
         self,
@@ -168,9 +165,9 @@ class RAGService:
         dependency_graph: dict | None = None,
         top_k: int = 10,
     ) -> list[RetrievedContext]:
-        """Perform hybrid search combining vector similarity and structural matching.
+        """Perform hybrid search combining BM25 and structural matching.
 
-        1. Vector search: Embed the query and find similar chunks in Qdrant.
+        1. Lexical search: Rank stored code chunks locally with BM25.
         2. Structural search: Match query terms against AST node names in the graph.
         3. Merge: Combine and deduplicate results, re-rank by score.
 
@@ -185,9 +182,9 @@ class RAGService:
         """
         results: list[RetrievedContext] = []
 
-        # ── 1. Vector Search ─────────────────────────────────
-        vector_results = self._vector_search(query, repository_id, top_k)
-        results.extend(vector_results)
+        # ── 1. Lexical Search ────────────────────────────────
+        lexical_results = self._lexical_search(query, repository_id, top_k)
+        results.extend(lexical_results)
 
         # ── 2. Structural Search ─────────────────────────────
         if dependency_graph:
@@ -205,32 +202,35 @@ class RAGService:
         )
         return merged
 
-    def _vector_search(
+    def _lexical_search(
         self, query: str, repository_id: str, top_k: int
     ) -> list[RetrievedContext]:
-        """Search Qdrant for semantically similar code chunks.
+        """Search stored code chunk payloads with BM25 lexical ranking.
 
         Args:
-            query: Natural language query to embed.
+            query: Natural-language or code-oriented query.
             repository_id: Filter results to this repository.
             top_k: Number of results.
 
         Returns:
-            List of RetrievedContext from vector search.
+            List of RetrievedContext from lexical search.
         """
-        try:
-            # Embed the query
-            response = self._openai.embeddings.create(
-                input=[query],
-                model=self.settings.openai_embedding_model,
-            )
-            query_vector = response.data[0].embedding
+        query_terms = set(self._tokenize(query))
+        if not query_terms:
+            return []
 
-            # Search Qdrant with repository filter
-            hits = self._qdrant.search(
-                collection_name=self.settings.qdrant_collection_name,
-                query_vector=query_vector,
-                query_filter=Filter(
+        self.ensure_collection()
+
+        documents: list[tuple[str | int, Counter[str], int]] = []
+        document_frequency: Counter[str] = Counter()
+        document_count = 0
+        total_document_length = 0
+        offset: int | str | None = None
+
+        while True:
+            records, next_offset = self._qdrant.scroll(
+                collection_name=self.settings.openrouter_qdrant_collection_name,
+                scroll_filter=Filter(
                     must=[
                         FieldCondition(
                             key="repository_id",
@@ -238,25 +238,89 @@ class RAGService:
                         )
                     ]
                 ),
-                limit=top_k,
+                limit=QDRANT_SCROLL_PAGE_SIZE,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
             )
 
-            return [
-                RetrievedContext(
-                    content=hit.payload.get("content", ""),
-                    file_path=hit.payload.get("file_path", ""),
-                    start_line=hit.payload.get("start_line", 0),
-                    end_line=hit.payload.get("end_line", 0),
-                    language=hit.payload.get("language", ""),
-                    relevance_score=min(hit.score, 1.0),
-                    retrieval_method="vector",
+            for record in records:
+                payload = record.payload
+                if not payload:
+                    continue
+                text = " ".join(
+                    str(payload.get(field) or "")
+                    for field in ("content", "file_path", "language", "node_name")
                 )
-                for hit in hits
-            ]
+                frequencies = Counter(self._tokenize(text))
+                document_count += 1
+                total_document_length += sum(frequencies.values())
+                matched_terms = query_terms.intersection(frequencies)
+                if matched_terms:
+                    documents.append((
+                        record.id,
+                        Counter({term: frequencies[term] for term in matched_terms}),
+                        sum(frequencies.values()),
+                    ))
+                    document_frequency.update(matched_terms)
 
-        except Exception as e:
-            logger.error("Vector search error: %s", e)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        if not documents or document_count == 0:
             return []
+
+        average_length = total_document_length / document_count
+        scored_documents: list[tuple[float, int, str | int]] = []
+        for index, (point_id, frequencies, document_length) in enumerate(documents):
+            score = 0.0
+            for term in query_terms.intersection(frequencies):
+                frequency = frequencies[term]
+                inverse_document_frequency = math.log(
+                    1 + (document_count - document_frequency[term] + 0.5)
+                    / (document_frequency[term] + 0.5)
+                )
+                length_normalization = 1.5 * (
+                    1 - 0.75 + 0.75 * document_length / max(average_length, 1)
+                )
+                score += inverse_document_frequency * (
+                    frequency * (1.5 + 1)
+                ) / (frequency + length_normalization)
+
+            scored_documents.append((score / (score + 1), index, point_id))
+
+        scored_documents.sort(key=lambda result: result[0], reverse=True)
+        point_ids = [point_id for _, _, point_id in scored_documents[:top_k]]
+        records = self._qdrant.retrieve(
+            collection_name=self.settings.openrouter_qdrant_collection_name,
+            ids=point_ids,
+            with_payload=True,
+            with_vectors=False,
+        )
+        payload_by_id = {
+            record.id: record.payload
+            for record in records
+            if record.payload
+        }
+
+        ranked: list[RetrievedContext] = []
+        for score, _, point_id in scored_documents[:top_k]:
+            payload = payload_by_id.get(point_id)
+            if not payload:
+                continue
+            ranked.append(
+                RetrievedContext(
+                    content=str(payload.get("content") or ""),
+                    file_path=str(payload.get("file_path") or ""),
+                    start_line=int(payload.get("start_line") or 0),
+                    end_line=int(payload.get("end_line") or 0),
+                    language=str(payload.get("language") or ""),
+                    relevance_score=score,
+                    retrieval_method="lexical",
+                )
+            )
+        return ranked
 
     def _structural_search(
         self, query: str, dependency_graph: dict, top_k: int
@@ -275,7 +339,7 @@ class RAGService:
         Returns:
             List of RetrievedContext from structural matching.
         """
-        query_terms = query.lower().split()
+        query_terms = self._tokenize(query)
         nodes: list[dict[str, Any]] = dependency_graph.get("nodes", [])
         matches: list[RetrievedContext] = []
 
@@ -292,7 +356,7 @@ class RAGService:
                     start_line=node.get("line_start", 0),
                     end_line=node.get("line_end", 0),
                     language="",
-                    relevance_score=min(score * 0.8, 1.0),  # Slightly lower weight than vector
+                    relevance_score=min(score * 0.8, 1.0),
                     retrieval_method="structural",
                 ))
 
@@ -303,7 +367,7 @@ class RAGService:
     def _merge_and_rerank(
         self, results: list[RetrievedContext], top_k: int
     ) -> list[RetrievedContext]:
-        """Merge vector and structural results, deduplicate, and re-rank.
+        """Merge lexical and structural results, deduplicate, and re-rank.
 
         Deduplication is by (file_path, start_line). When duplicates exist,
         the higher-scoring entry is kept.
@@ -319,38 +383,30 @@ class RAGService:
         seen: dict[tuple[str, int], RetrievedContext] = {}
         for ctx in results:
             key = (ctx.file_path, ctx.start_line)
-            if key not in seen or ctx.relevance_score > seen[key].relevance_score:
+            existing = seen.get(key)
+            if (
+                existing is None
+                or (
+                    ctx.retrieval_method == "lexical"
+                    and existing.retrieval_method == "structural"
+                )
+                or ctx.relevance_score > existing.relevance_score
+            ):
                 seen[key] = ctx
 
         # Sort by relevance score descending
         merged = sorted(seen.values(), key=lambda x: x.relevance_score, reverse=True)
         return merged[:top_k]
 
-    def _prepare_chunk_text(self, chunk: CodeChunk) -> str:
-        """Prepare a code chunk's text for embedding.
-
-        Prefixes with metadata for better semantic matching.
+    def delete_repository_chunks(self, repository_id: str) -> None:
+        """Delete all indexed code chunks for a repository from Qdrant.
 
         Args:
-            chunk: The code chunk to prepare.
-
-        Returns:
-            Formatted text for the embedding model.
-        """
-        prefix = f"[{chunk.language}] {chunk.file_path}"
-        if chunk.node_name:
-            prefix += f" :: {chunk.chunk_type} {chunk.node_name}"
-        return f"{prefix}\n\n{chunk.content}"
-
-    def delete_repository_embeddings(self, repository_id: str) -> None:
-        """Delete all embeddings for a repository from Qdrant.
-
-        Args:
-            repository_id: The repository whose embeddings to delete.
+            repository_id: The repository whose indexed chunks to delete.
         """
         try:
             self._qdrant.delete(
-                collection_name=self.settings.qdrant_collection_name,
+                collection_name=self.settings.openrouter_qdrant_collection_name,
                 points_selector=Filter(
                     must=[
                         FieldCondition(
@@ -360,6 +416,6 @@ class RAGService:
                     ]
                 ),
             )
-            logger.info("Deleted embeddings for repository %s", repository_id)
+            logger.info("Deleted indexed code chunks for repository %s", repository_id)
         except Exception as e:
-            logger.error("Failed to delete embeddings for %s: %s", repository_id, e)
+            logger.error("Failed to delete indexed code chunks for %s: %s", repository_id, e)

@@ -68,7 +68,7 @@ export default function HomePage() {
           <FeatureCard
             icon="🧠"
             title="Hybrid RAG"
-            description="Combining structural AST name matching with Qdrant vector semantic search"
+            description="Combining local BM25 code search with structural AST matching"
           />
           <FeatureCard
             icon="📊"

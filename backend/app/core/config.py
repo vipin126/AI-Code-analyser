@@ -97,11 +97,12 @@ class Settings(BaseSettings):
     qdrant_port: int = 6333
     qdrant_grpc_port: int = 6334
     qdrant_api_key: str | None = None  # Cloud API key
-    qdrant_collection_name: str = "code_embeddings"
+    openrouter_qdrant_collection_name: str = "code_chunks_openrouter"
 
-    # ── OpenAI ───────────────────────────────────────────────
-    openai_api_key: str = ""
-    openai_embedding_model: str = "text-embedding-3-small"
+    # ── OpenRouter ──────────────────────────────────────────
+    openrouter_api_key: str = ""
+    openrouter_model: str = "google/gemma-4-26b-a4b-it:free"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
 
     # ── Auth (Future) ────────────────────────────────────────
     jwt_secret_key: str = "change-this-to-a-random-secret"

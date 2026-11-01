@@ -119,75 +119,102 @@ export const api = {
       onError?: (error: string) => void;
     }
   ): Promise<void> {
-    const url = `${API_BASE}/repositories/${repoId}/chat/${sessionId}/messages`;
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-    });
-
-    if (!response.ok) {
-      let err = `Failed to send message: ${response.statusText}`;
-      try {
-        const data = await response.json();
-        err = data.detail || err;
-      } catch {
-        // ignore
-      }
-      handlers.onError?.(err);
-      return;
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      handlers.onError?.("No response body available to stream");
-      return;
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = "";
-
     try {
+      const url = `${API_BASE}/repositories/${repoId}/chat/${sessionId}/messages`;
+      const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content }),
+      });
+
+      if (!response.ok) {
+        let err = `Failed to send message: ${response.statusText}`;
+        try {
+          const data = await response.json();
+          err = data.detail || err;
+        } catch {
+          // Ignore non-JSON error bodies.
+        }
+        handlers.onError?.(err);
+        return;
+      }
+
+      const reader = response.body?.getReader();
+      if (!reader) {
+        handlers.onError?.("No response body available to stream");
+        return;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let completed = false;
+
+      const processEvent = (rawEvent: string): "continue" | "done" | "error" => {
+        if (!rawEvent.trim()) return "continue";
+        const lines = rawEvent.split("\n");
+        let eventType = "message";
+        let eventData = "";
+
+        for (const line of lines) {
+          if (line.startsWith("event: ")) {
+            eventType = line.substring(7).trim();
+          } else if (line.startsWith("data: ")) {
+            eventData = line.substring(6).trim();
+          }
+        }
+        if (!eventData) return "continue";
+
+        try {
+          const parsed = JSON.parse(eventData);
+          if (eventType === "context") {
+            handlers.onContext?.(parsed.chunks || []);
+          } else if (eventType === "token") {
+            handlers.onToken?.(parsed.content || "");
+          } else if (eventType === "done") {
+            handlers.onDone?.(parsed.message_id || "");
+            return "done";
+          } else if (eventType === "error") {
+            handlers.onError?.(parsed.detail || "Streaming error");
+            return "error";
+          }
+        } catch (err) {
+          console.error("Failed to parse SSE event data:", eventData, err);
+        }
+        return "continue";
+      };
+
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          buffer += decoder.decode();
+          break;
+        }
 
         buffer += decoder.decode(value, { stream: true });
         const events = buffer.split("\n\n");
-        // Keep the incomplete part in buffer
         buffer = events.pop() || "";
 
         for (const rawEvent of events) {
-          if (!rawEvent.trim()) continue;
-          const lines = rawEvent.split("\n");
-          let eventType = "message";
-          let eventData = "";
-
-          for (const line of lines) {
-            if (line.startsWith("event: ")) {
-              eventType = line.substring(7).trim();
-            } else if (line.startsWith("data: ")) {
-              eventData = line.substring(6).trim();
-            }
+          const result = processEvent(rawEvent);
+          if (result === "done") {
+            completed = true;
+            await reader.cancel();
+            return;
           }
-
-          if (!eventData) continue;
-
-          try {
-            const parsed = JSON.parse(eventData);
-            if (eventType === "context") {
-              handlers.onContext?.(parsed.chunks || []);
-            } else if (eventType === "token") {
-              handlers.onToken?.(parsed.content || "");
-            } else if (eventType === "done") {
-              handlers.onDone?.(parsed.message_id || "");
-            } else if (eventType === "error") {
-              handlers.onError?.(parsed.detail || "Streaming error");
-            }
-          } catch (e) {
-            console.error("Failed to parse SSE event data:", eventData, e);
+          if (result === "error") {
+            await reader.cancel();
+            return;
           }
         }
+      }
+
+      if (buffer.trim()) {
+        const result = processEvent(buffer);
+        if (result === "done") completed = true;
+        if (result === "error") return;
+      }
+      if (!completed) {
+        handlers.onError?.("The response stream ended before the assistant finished.");
       }
     } catch (err) {
       handlers.onError?.(err instanceof Error ? err.message : String(err));

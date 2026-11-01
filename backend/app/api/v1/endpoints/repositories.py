@@ -135,16 +135,16 @@ def delete_repository(
 ) -> None:
     """Delete a repository and all associated data.
 
-    Also removes embeddings from Qdrant.
+    Also removes indexed code chunks from Qdrant.
     """
     from app.services.rag_service import RAGService
 
-    # Clean up Qdrant embeddings
+    # Clean up indexed Qdrant payloads
     try:
         rag_service = RAGService()
-        rag_service.delete_repository_embeddings(str(repository_id))
+        rag_service.delete_repository_chunks(str(repository_id))
     except Exception as e:
-        logger.warning("Failed to delete Qdrant embeddings for %s: %s", repository_id, e)
+        logger.warning("Failed to delete indexed Qdrant chunks for %s: %s", repository_id, e)
 
     db.delete(repo)
     db.commit()

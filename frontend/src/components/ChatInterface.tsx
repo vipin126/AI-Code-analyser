@@ -9,12 +9,25 @@ interface ChatInterfaceProps {
   repositoryName: string;
 }
 
+function removeUnansweredMessages(messages: ChatMessageItem[]): ChatMessageItem[] {
+  const completedMessages = [...messages];
+  while (
+    completedMessages.length > 0 &&
+    completedMessages[completedMessages.length - 1].role === "user"
+  ) {
+    completedMessages.pop();
+  }
+  return completedMessages;
+}
+
 export default function ChatInterface({
   repositoryId,
   repositoryName,
 }: ChatInterfaceProps) {
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessageItem[]>([]);
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [initializationAttempt, setInitializationAttempt] = useState(0);
   const [input, setInput] = useState("");
   const [isStreaming, setIsStreaming] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
@@ -30,27 +43,68 @@ export default function ChatInterface({
 
   // Initialize or fetch first session
   useEffect(() => {
+    let active = true;
+
     async function initChat() {
+      setIsInitializing(true);
+      setError(null);
       try {
         const sessions = await api.listChatSessions(repositoryId);
         if (sessions.length > 0) {
-          setSessionId(sessions[0].id);
           const history = await api.getChatMessages(repositoryId, sessions[0].id);
-          setMessages(history.messages);
+          if (active) {
+            setSessionId(sessions[0].id);
+            setMessages(removeUnansweredMessages(history.messages));
+          }
         } else {
           const newSession = await api.createChatSession(
             repositoryId,
             `Onboarding Chat - ${repositoryName}`
           );
-          setSessionId(newSession.id);
+          if (active) setSessionId(newSession.id);
         }
       } catch (err) {
         console.error("Failed to init chat session:", err);
+        if (active) {
+          setError(
+            err instanceof Error
+              ? err.message
+              : "Failed to initialize the onboarding chat."
+          );
+        }
+      } finally {
+        if (active) setIsInitializing(false);
       }
     }
 
-    initChat();
-  }, [repositoryId, repositoryName]);
+    void initChat();
+    return () => {
+      active = false;
+    };
+  }, [repositoryId, repositoryName, initializationAttempt]);
+
+  const handleNewChat = async () => {
+    if (isInitializing || isStreaming) return;
+    setIsInitializing(true);
+    setError(null);
+    try {
+      const newSession = await api.createChatSession(
+        repositoryId,
+        `Onboarding Chat - ${repositoryName}`
+      );
+      setSessionId(newSession.id);
+      setMessages([]);
+      setInput("");
+      setStreamingContent("");
+      setStreamingChunks([]);
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Failed to start a new chat."
+      );
+    } finally {
+      setIsInitializing(false);
+    }
+  };
 
   const handleSend = async (customPrompt?: string) => {
     const textToSend = customPrompt || input;
@@ -99,6 +153,9 @@ export default function ChatInterface({
       },
       onError: (err) => {
         setIsStreaming(false);
+        setMessages((prev) => prev.filter((message) => message.id !== tempUserMsg.id));
+        setStreamingContent("");
+        setStreamingChunks([]);
         setError(err);
       },
     });
@@ -111,9 +168,17 @@ export default function ChatInterface({
         <div>
           <h3 className="font-semibold text-white">Architecture & Onboarding Assistant</h3>
           <p className="text-xs text-gray-500">
-            Powered by AST structural nodes + Qdrant hybrid vector embeddings
+            Powered by OpenRouter Gemma + local BM25 and AST search
           </p>
         </div>
+        <button
+          type="button"
+          onClick={handleNewChat}
+          disabled={isInitializing || isStreaming}
+          className="rounded-lg border border-gray-700 px-3 py-1.5 text-xs font-medium text-gray-300 hover:border-primary-500 hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          New chat
+        </button>
       </div>
 
       {/* Messages Scroll Area */}
@@ -218,6 +283,15 @@ export default function ChatInterface({
         {error && (
           <div className="mb-3 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-1.5 text-xs text-red-400">
             {error}
+            {!sessionId && !isInitializing && (
+              <button
+                type="button"
+                onClick={() => setInitializationAttempt((attempt) => attempt + 1)}
+                className="ml-2 font-semibold text-red-300 underline hover:text-white"
+              >
+                Retry
+              </button>
+            )}
           </div>
         )}
 
@@ -232,13 +306,17 @@ export default function ChatInterface({
             type="text"
             value={input}
             onChange={(e) => setInput(e.target.value)}
-            placeholder="Ask about architectural patterns, dependency flow, or onboarding..."
-            disabled={isStreaming}
+            placeholder={
+              isInitializing
+                ? "Connecting to onboarding chat..."
+                : "Ask about architectural patterns, dependency flow, or onboarding..."
+            }
+            disabled={isStreaming || isInitializing || !sessionId}
             className="flex-1 rounded-lg border border-gray-800 bg-gray-900 px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:border-primary-500 focus:outline-none focus:ring-1 focus:ring-primary-500 disabled:opacity-50"
           />
           <button
             type="submit"
-            disabled={isStreaming || !input.trim()}
+            disabled={isStreaming || isInitializing || !sessionId || !input.trim()}
             className="rounded-lg bg-primary-600 px-5 py-2.5 text-sm font-semibold text-white hover:bg-primary-500 disabled:opacity-50 disabled:cursor-not-allowed transition-all"
           >
             Send

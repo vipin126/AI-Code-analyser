@@ -220,7 +220,7 @@ class ParserService:
             source: Raw source bytes.
 
         Returns:
-            List of CodeChunk objects suitable for embedding.
+            List of CodeChunk objects suitable for local code search.
         """
         if language not in SUPPORTED_LANGUAGES:
             return []

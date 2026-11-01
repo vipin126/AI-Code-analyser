@@ -13,7 +13,7 @@ class CodeFile(BaseModel):
     """A single source code file extracted from a repository.
 
     Stores the file metadata, parsed AST data, extracted dependency
-    edges, and a reference to the corresponding Qdrant embedding vector.
+    edges, and an optional reference to its Qdrant index point.
     """
 
     __tablename__ = "code_files"
@@ -50,7 +50,7 @@ class CodeFile(BaseModel):
     )
     embedding_id: Mapped[str | None] = mapped_column(
         String(255), nullable=True,
-        comment="Qdrant point ID for the file's embedding vector",
+        comment="Qdrant point ID for the file's searchable code chunk",
     )
     summary: Mapped[str | None] = mapped_column(
         Text, nullable=True,

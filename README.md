@@ -1,6 +1,6 @@
 # AI Codebase Architecture & Onboarding Analyzer
 
-> Automated codebase analysis, architecture visualization, and onboarding documentation — powered by AST parsing, vector embeddings, and hybrid RAG synthesis.
+> Automated codebase analysis, architecture visualization, and onboarding documentation — powered by AST parsing, local code search, and OpenRouter chat completions.
 
 ## Architecture Overview
 
@@ -29,7 +29,7 @@
 | Database    | PostgreSQL 16 + SQLAlchemy 2.0 + Alembic      |
 | Vector DB   | Qdrant                                        |
 | AST Parsing | Tree-sitter                                   |
-| AI          | OpenAI Embeddings + Hybrid RAG                |
+| AI          | OpenRouter Gemma chat + local BM25/AST retrieval |
 
 ## Quickstart
 
@@ -47,7 +47,7 @@ cd AI\ CODE\ ANALAYSER
 
 # Copy environment template
 cp .env.example .env
-# Edit .env with your actual values (especially OPENAI_API_KEY)
+# Edit .env with your actual values (especially OPENROUTER_API_KEY)
 ```
 
 ### 2. Start Infrastructure
@@ -74,6 +74,26 @@ alembic upgrade head
 # Start the API server
 uvicorn app.main:app --reload --port 8000
 ```
+
+Create an API key in [OpenRouter](https://openrouter.ai/settings/keys) and set
+`OPENROUTER_API_KEY` in the environment used by the backend
+(`backend/.env` for local development, or the root `.env` for Docker Compose).
+The configured default model is `google/gemma-4-26b-a4b-it:free`; change
+`OPENROUTER_MODEL` if you select a different OpenRouter model. Free model availability,
+rate limits, and credits are controlled by OpenRouter and may change.
+HTTP 429 responses can be caused either by OpenRouter's free-model request caps
+or by temporary capacity limits at the model provider. Provider-capacity failures
+may not appear as billable activity; check `GET /api/v1/key` and its
+`free_model_daily_requests` field for the account's free-model daily quota.
+Creating another API key does not bypass shared free-model limits.
+
+Gemma is a chat model, not an embedding model. Code chunks are stored in Qdrant and
+retrieved locally using BM25 keyword ranking plus AST-name matching, so indexing does
+not make external embedding requests. Chat uses OpenRouter streaming: it tries the
+configured model first, then `openrouter/free`, which selects another available free
+model if the configured model's providers are rate-limited. No paid fallback is used. The new
+`code_chunks_openrouter` Qdrant collection is separate from previous embedding
+collections; resubmit repositories to populate it for local retrieval.
 
 ### 4. Run Frontend (Local Dev)
 
